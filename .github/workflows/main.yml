@@ -417,4 +417,626 @@ jobs:
           cat > "app/src/main/java/com/vineet/dost/Fbank.kt" <<'__EOF__'
           package com.vineet.dost
 
-          import kotl
+          import kotlin.math.PI
+                    import kotlin.math.cos
+          import kotlin.math.ln
+          import kotlin.math.sin
+
+          /** Kaldi-style 80-dim log-mel fbank (speaker model ke input ke liye). */
+          object Fbank {
+              private const val SR = 16000
+              private const val FL = 400
+              private const val FS = 160
+              private const val NFFT = 512
+              private const val NM = 80
+
+              private val window = FloatArray(FL) {
+                  Math.pow(0.5 - 0.5 * cos(2.0 * PI * it / (FL - 1)), 0.85).toFloat()
+              }
+              private val melBank: Array<FloatArray> = buildMel()
+
+              private fun mel(f: Double) = 1127.0 * ln(1.0 + f / 700.0)
+
+              private fun buildMel(): Array<FloatArray> {
+                  val low = mel(20.0)
+                  val high = mel(8000.0)
+                  val delta = (high - low) / (NM + 1)
+                  return Array(NM) { b ->
+                      val left = low + b * delta
+                      val center = low + (b + 1) * delta
+                      val right = low + (b + 2) * delta
+                      FloatArray(NFFT / 2 + 1) { i ->
+                          val m = mel(i * SR.toDouble() / NFFT)
+                          if (m > left && m < right) {
+                              (if (m <= center) (m - left) / (center - left) else (right - m) / (right - center)).toFloat()
+                          } else 0f
+                      }
+                  }
+              }
+
+              fun compute(pcm: ShortArray): Array<FloatArray>? {
+                  if (pcm.size < FL + FS) return null
+                  val frames = 1 + (pcm.size - FL) / FS
+                  val out = Array(frames) { FloatArray(NM) }
+                  val re = FloatArray(NFFT)
+                  val im = FloatArray(NFFT)
+                  val w = FloatArray(FL)
+                  for (t in 0 until frames) {
+                      val off = t * FS
+                      var mean = 0f
+                      for (i in 0 until FL) { w[i] = pcm[off + i].toFloat(); mean += w[i] }
+                      mean /= FL
+                      for (i in 0 until FL) w[i] -= mean
+                      for (i in FL - 1 downTo 1) w[i] -= 0.97f * w[i - 1]
+                      w[0] -= 0.97f * w[0]
+                      java.util.Arrays.fill(re, 0f)
+                      java.util.Arrays.fill(im, 0f)
+                      for (i in 0 until FL) re[i] = w[i] * window[i]
+                      fft(re, im)
+                      val power = FloatArray(NFFT / 2 + 1) { re[it] * re[it] + im[it] * im[it] }
+                      for (b in 0 until NM) {
+                          var e = 0f
+                          val mb = melBank[b]
+                          for (i in power.indices) e += power[i] * mb[i]
+                          out[t][b] = ln(maxOf(e, 1.1920929e-7f))
+                      }
+                  }
+                  // cepstral mean normalization
+                  for (b in 0 until NM) {
+                      var m = 0f
+                      for (t in 0 until frames) m += out[t][b]
+                      m /= frames
+                      for (t in 0 until frames) out[t][b] -= m
+                  }
+                  return out
+              }
+
+              private fun fft(re: FloatArray, im: FloatArray) {
+                  val n = re.size
+                  var j = 0
+                  for (i in 1 until n) {
+                      var bit = n shr 1
+                      while ((j and bit) != 0) { j = j xor bit; bit = bit shr 1 }
+                      j = j xor bit
+                      if (i < j) {
+                          val tr = re[i]; re[i] = re[j]; re[j] = tr
+                          val ti = im[i]; im[i] = im[j]; im[j] = ti
+                      }
+                  }
+                  var len = 2
+                  while (len <= n) {
+                      val ang = -2.0 * PI / len
+                      val wr = cos(ang).toFloat()
+                      val wi = sin(ang).toFloat()
+                      var i = 0
+                      while (i < n) {
+                          var cr = 1f
+                          var ci = 0f
+                          val half = len / 2
+                          for (k in 0 until half) {
+                              val ur = re[i + k]; val ui = im[i + k]
+                              val vr = re[i + k + half] * cr - im[i + k + half] * ci
+                              val vi = re[i + k + half] * ci + im[i + k + half] * cr
+                              re[i + k] = ur + vr; im[i + k] = ui + vi
+                              re[i + k + half] = ur - vr; im[i + k + half] = ui - vi
+                              val ncr = cr * wr - ci * wi
+                              ci = cr * wi + ci * wr
+                              cr = ncr
+                          }
+                          i += len
+                      }
+                      len = len shl 1
+                  }
+              }
+          }
+          __EOF__
+          mkdir -p "app/src/main/java/com/vineet/dost"
+          cat > "app/src/main/java/com/vineet/dost/LockService.kt" <<'__EOF__'
+          package com.vineet.dost
+
+          import android.accessibilityservice.AccessibilityService
+          import android.view.accessibility.AccessibilityEvent
+
+          class LockService : AccessibilityService() {
+              override fun onServiceConnected() { instance = this }
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+              override fun onUnbind(intent: android.content.Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+              companion object {
+                  var instance: LockService? = null
+                  fun lock(): Boolean =
+                      instance?.performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN) ?: false
+              }
+          }
+          __EOF__
+          mkdir -p "app/src/main/java/com/vineet/dost"
+          cat > "app/src/main/java/com/vineet/dost/MainActivity.kt" <<'__EOF__'
+          package com.vineet.dost
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.hardware.biometrics.BiometricPrompt
+          import android.os.CancellationSignal
+          import java.util.concurrent.atomic.AtomicBoolean
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.view.Gravity
+          import android.view.inputmethod.EditorInfo
+          import android.widget.*
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.util.Locale
+          import kotlin.math.abs
+
+          class MainActivity : Activity() {
+
+              companion object {
+                  /** Awaaz match threshold (0-1). Status line mein score dikhta hai, usse tune karo. */
+                  const val SPEAKER_THRESHOLD = 0.5f
+              }
+
+              private lateinit var chatView: TextView
+              private lateinit var scroll: ScrollView
+              private lateinit var input: EditText
+              private lateinit var micBtn: Button
+              private lateinit var handsBtn: Button
+              private lateinit var lockBtn: Button
+              private lateinit var moodView: TextView
+              private lateinit var statusView: TextView
+              private var tts: TextToSpeech? = null
+              private var recognizer: SpeechRecognizer? = null
+              private val handler = Handler(Looper.getMainLooper())
+              private val history = JSONArray()
+              private val capture = AudioCapture()
+
+              private var listening = false
+              private var speaking = false
+              private var handsFree = false
+              private var voiceLock = false
+              private var enrolling = false
+              private var warnedShared = false
+
+              private var rmsSum = 0f
+              private var rmsCount = 0
+              private var speechStartMs = 0L
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  buildUi()
+
+                  tts = TextToSpeech(this) { status ->
+                      if (status == TextToSpeech.SUCCESS) tts?.language = Locale("hi", "IN")
+                  }
+                  tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(id: String?) {}
+                      override fun onError(id: String?) { speaking = false; runOnUiThread { resumeIfHandsFree() } }
+                      override fun onDone(id: String?) { speaking = false; runOnUiThread { resumeIfHandsFree() } }
+                  })
+
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+                  }
+                  if (apiKey().isBlank()) askApiKey()
+                  append("Dost", "Heyy! Bolo, kya chal raha hai? 😄")
+
+                  status("Voice models load ho rahe hain...")
+                  Thread {
+                      Analyzer.init(this)
+                      status(modelStatus())
+                  }.start()
+              }
+
+              private fun modelStatus() =
+                  "Speaker model: ${if (Analyzer.spkReady) "✅" else "❌"}  Emotion model: ${if (Analyzer.emoReady) "✅" else "❌"}" +
+                      "  Awaaz enrolled: ${if (enrolled() != null) "✅" else "❌"}"
+
+              private fun status(s: String) = runOnUiThread { statusView.text = s }
+
+              // ---------- UI ----------
+              private fun buildUi() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#0F0F14"))
+                      setPadding(24, 48, 24, 24)
+                  }
+                  val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  top.addView(TextView(this).apply { text = "Dost AI"; textSize = 22f; setTextColor(Color.WHITE) },
+                      LinearLayout.LayoutParams(0, -2, 1f))
+                  moodView = TextView(this).apply { text = "🙂"; textSize = 24f }
+                  top.addView(moodView)
+                  top.addView(Button(this).apply { text = "Key"; textSize = 11f; setOnClickListener { askApiKey() } })
+                  root.addView(top)
+
+                  val row2 = LinearLayout(this)
+                  handsBtn = Button(this).apply { text = "Hands-free: OFF"; textSize = 10f; setOnClickListener { setHandsFree(!handsFree) } }
+                  lockBtn = Button(this).apply { text = "Voice lock: OFF"; textSize = 10f; setOnClickListener { toggleVoiceLock() } }
+                  val enrollBtn = Button(this).apply { text = "Awaaz enroll"; textSize = 10f; setOnClickListener { enroll() } }
+                  row2.addView(handsBtn, LinearLayout.LayoutParams(0, -2, 1f))
+                  row2.addView(lockBtn, LinearLayout.LayoutParams(0, -2, 1f))
+                  row2.addView(enrollBtn, LinearLayout.LayoutParams(0, -2, 1f))
+                  root.addView(row2)
+
+                  statusView = TextView(this).apply { textSize = 11f; setTextColor(Color.parseColor("#9AA0A6")) }
+                  root.addView(statusView)
+
+                  scroll = ScrollView(this)
+                  chatView = TextView(this).apply {
+                      textSize = 16f; setTextColor(Color.parseColor("#EDEDED")); setLineSpacing(0f, 1.2f)
+                  }
+                  scroll.addView(chatView)
+                  root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  val bottom = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  input = EditText(this).apply {
+                      hint = "Kuch bolo ya likho..."; setHintTextColor(Color.GRAY); setTextColor(Color.WHITE)
+                      imeOptions = EditorInfo.IME_ACTION_SEND; maxLines = 3
+                      setOnEditorActionListener { _, _, _ -> sendTyped(); true }
+                  }
+                  bottom.addView(input, LinearLayout.LayoutParams(0, -2, 1f))
+                  bottom.addView(Button(this).apply { text = "Bhejo"; setOnClickListener { sendTyped() } })
+                  micBtn = Button(this).apply { text = "🎤"; setOnClickListener { toggleMic() } }
+                  bottom.addView(micBtn)
+                  root.addView(bottom)
+                  setContentView(root)
+              }
+
+              private fun append(who: String, msg: String) = runOnUiThread {
+                  chatView.append("$who: $msg\n\n")
+                  scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+              }
+
+              // ---------- API key + prefs ----------
+              private fun prefs() = getSharedPreferences("dost", MODE_PRIVATE)
+              private fun apiKey() = prefs().getString("key", "") ?: ""
+
+              private fun askApiKey() {
+                  val et = EditText(this).apply { hint = "sk-ant-..."; setText(apiKey()) }
+                  AlertDialog.Builder(this)
+                      .setTitle("Anthropic API Key")
+                      .setMessage("Ye key sirf tumhare phone mein save hoti hai.")
+                      .setView(et)
+                      .setPositiveButton("Save") { _, _ -> prefs().edit().putString("key", et.text.toString().trim()).apply() }
+                      .show()
+              }
+
+              private fun enrolled(): FloatArray? {
+                  val s = prefs().getString("voiceprint", null) ?: return null
+                  return try { s.split(",").map { it.toFloat() }.toFloatArray() } catch (e: Exception) { null }
+              }
+
+              // ---------- Voice enroll ----------
+              private fun enroll() {
+                  if (!Analyzer.spkReady) { append("Dost", "Speaker model load nahi hua, isliye enroll nahi ho sakta."); return }
+                  if (enrolling) return
+                  setHandsFree(false)
+                  recognizer?.cancel(); listening = false; capture.stop(); tts?.stop()
+                  enrolling = true
+                  val prompts = listOf(
+                      "Mera naam Vineet hai aur main apne phone se baat kar raha hoon.",
+                      "Aaj mausam bahut accha hai, chalo kuch gaana chalate hain.",
+                      "Dost, mujhe kal subah saat baje uthna hai."
+                  )
+                  Thread {
+                      val embs = mutableListOf<FloatArray>()
+                      for ((idx, p) in prompts.withIndex()) {
+                          append("Dost", "Enroll ${idx + 1}/3: abhi 5 second tak ye bolo (ya kuch bhi natural bolo):\n\"$p\"")
+                          Thread.sleep(1500)
+                          if (!capture.start()) { append("Dost", "Mic start nahi hua."); enrolling = false; return@Thread }
+                          Thread.sleep(5500)
+                          val pcm = capture.snapshot(5f)
+                          capture.stop()
+                          if (pcm.isEmpty() || pcm.maxOf { abs(it.toInt()) } < 100) {
+                              append("Dost", "Awaaz sunai nahi di, mic permission check karo aur dobara try karo.")
+                              enrolling = false; return@Thread
+                          }
+                          Analyzer.embedding(pcm)?.let { embs.add(it) }
+                      }
+                      if (embs.size < 2) { append("Dost", "Enroll fail ho gaya, dobara try karo."); enrolling = false; return@Thread }
+                      val sum = FloatArray(embs[0].size)
+                      for (e in embs) for (i in sum.indices) sum[i] += e[i]
+                      val vp = Analyzer.l2(sum)
+                      prefs().edit().putString("voiceprint", vp.joinToString(",")).apply()
+                      append("Dost", "Done! Tumhari awaaz save ho gayi. Ab \"Voice lock\" ON karke dekho.")
+                      status(modelStatus())
+                      enrolling = false
+                  }.start()
+              }
+
+              private fun toggleVoiceLock() {
+                  if (!voiceLock && enrolled() == null) { append("Dost", "Pehle \"Awaaz enroll\" karo."); return }
+                  voiceLock = !voiceLock
+                  lockBtn.text = if (voiceLock) "Voice lock: ON" else "Voice lock: OFF"
+                  if (voiceLock) append("Dost", "Voice lock ON. Mic se sirf tumhari awaaz par kaam karungi (type karke bologe to chalega). Voice se app kholne se pehle fingerprint bhi maangungi.")
+              }
+
+              // ---------- Listening ----------
+              private val listener = object : RecognitionListener {
+                  override fun onReadyForSpeech(p: Bundle?) { micBtn.text = "⏹" }
+                  override fun onBeginningOfSpeech() { speechStartMs = System.currentTimeMillis() }
+                  override fun onRmsChanged(rmsdB: Float) { if (rmsdB > 0f) { rmsSum += rmsdB; rmsCount++ } }
+                  override fun onBufferReceived(buffer: ByteArray?) {}
+                  override fun onEndOfSpeech() {}
+                  override fun onPartialResults(p: Bundle?) {}
+                  override fun onEvent(t: Int, p: Bundle?) {}
+
+                  override fun onError(error: Int) {
+                      listening = false; micBtn.text = "🎤"; capture.stop()
+                      if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) { setHandsFree(false); return }
+                      resumeIfHandsFree()
+                  }
+
+                  override fun onResults(r: Bundle?) {
+                      listening = false; micBtn.text = "🎤"
+                      val secs = ((System.currentTimeMillis() - speechStartMs) / 1000f + 0.5f).coerceIn(1f, 10f)
+                      val pcm = capture.snapshot(secs)
+                      capture.stop()
+
+                      val t = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                      if (t.isNullOrBlank()) { resumeIfHandsFree(); return }
+                      val basicHint = voiceHint(t)
+                      var text = t
+                      if (handsFree) {
+                          val m = Regex("(?i)(hey |hi |ok )?(dost|दोस्त)[,!]? ?").find(text)
+                          if (m == null) { resumeIfHandsFree(); return }
+                          text = text.removeRange(m.range).trim()
+                          if (text.isBlank()) { speak("Haan bolo!", "neutral"); return }
+                      }
+                      val finalText = text
+                      Thread { process(finalText, basicHint, pcm) }.start()
+                  }
+              }
+
+              /** Asli voice analysis: kaun bola + kaise bola. */
+              private fun process(text: String, basicHint: String, pcm: ShortArray) {
+                  var hint = basicHint
+                  var voiceMood: String? = null
+                  val silent = pcm.size < 8000 || pcm.maxOf { abs(it.toInt()) } < 60
+
+                  if (silent) {
+                      status("Mic share nahi hua (audio khali) - analysis off. " + modelStatus())
+                      if (!warnedShared && (voiceLock || Analyzer.emoReady)) {
+                          warnedShared = true
+                          append("Dost", "Note: is phone par speech recognition ke saath mic share nahi ho raha, to asli awaaz-analysis band hai. Purane andaze wale mode par chal rahi hoon.")
+                      }
+                  } else {
+                      val emo = Analyzer.emotion(pcm)
+                      var score: Float? = null
+                      val vp = enrolled()
+                      if (vp != null && Analyzer.spkReady) {
+                          Analyzer.embedding(pcm)?.let { score = Analyzer.cosine(it, vp) }
+                      }
+                      if (emo != null) {
+                          hint += ", voice-model emotion: ${emo.first} ${(emo.second * 100).toInt()}% (English acted-data model, Hindi mein galat ho sakta hai)"
+                          if (emo.second >= 0.6f) voiceMood = Analyzer.toMood(emo.first)
+                      }
+                      status("Match: ${score?.let { "%.2f".format(it) } ?: "-"} | Emotion: ${emo?.let { "${it.first} ${(it.second * 100).toInt()}%" } ?: "-"}")
+
+                      if (voiceLock && score != null && score!! < SPEAKER_THRESHOLD) {
+                          val msg = "Hmm, ye tumhari awaaz jaisi nahi lag rahi (match ${"%.2f".format(score)}). Tum ho to type karke bol do."
+                          append("Dost", msg)
+                          runOnUiThread { speak(msg, "neutral") }
+                          return
+                      }
+                  }
+                  send(text, hint, voiceMood, true)
+              }
+
+              private fun voiceHint(text: String): String {
+                  val avg = if (rmsCount > 0) rmsSum / rmsCount else 0f
+                  val secs = ((System.currentTimeMillis() - speechStartMs) / 1000f).coerceAtLeast(0.5f)
+                  val wps = text.trim().split(Regex("\\s+")).size / secs
+                  val vol = when { avg > 6f -> "awaaz tez/loud"; avg < 2.5f -> "awaaz dheemi/soft"; else -> "awaaz normal" }
+                  val spd = when { wps > 3.5f -> "bolne ki speed fast"; wps < 1.5f -> "bolne ki speed slow"; else -> "speed normal" }
+                  return "$vol, $spd"
+              }
+
+              private fun startListening() {
+                  if (listening || speaking || enrolling) return
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      append("Dost", "Is phone mein speech recognition nahi mil raha. Likh ke bol do.")
+                      setHandsFree(false); return
+                  }
+                  recognizer?.destroy()
+                  recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply { setRecognitionListener(listener) }
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
+                  }
+                  rmsSum = 0f; rmsCount = 0; speechStartMs = System.currentTimeMillis()
+                  if (Analyzer.spkReady || Analyzer.emoReady) capture.start()
+                  listening = true
+                  recognizer?.startListening(i)
+              }
+
+              private fun toggleMic() {
+                  if (listening) { recognizer?.stopListening(); return }
+                  tts?.stop(); speaking = false
+                  startListening()
+              }
+
+              private fun setHandsFree(on: Boolean) {
+                  handsFree = on
+                  handsBtn.text = if (on) "Hands-free: ON" else "Hands-free: OFF"
+                  if (on) {
+                      append("Dost", "Hands-free ON. \"Dost, ...\" bolke bulao, main sun rahi hoon.")
+                      startListening()
+                  } else {
+                      recognizer?.cancel(); listening = false; capture.stop(); micBtn.text = "🎤"
+                  }
+              }
+
+              private fun resumeIfHandsFree() {
+                  if (!handsFree) return
+                  handler.postDelayed({ if (handsFree && !speaking && !listening) startListening() }, 600)
+              }
+
+              // ---------- Chat ----------
+              private fun sendTyped() {
+                  val t = input.text.toString().trim()
+                  if (t.isNotEmpty()) { input.setText(""); Thread { send(t, "", null, false) }.start() }
+              }
+
+              private fun send(userText: String, hint: String, voiceMood: String?, fromVoice: Boolean) {
+                  if (apiKey().isBlank()) { runOnUiThread { askApiKey() }; return }
+                  append("Tum", userText)
+                  val content = if (hint.isNotEmpty()) "$userText\n[voice hint: $hint]" else userText
+                  history.put(JSONObject().put("role", "user").put("content", content))
+                  trimHistory()
+                  try {
+                      val reply = ClaudeClient.chat(apiKey(), history)
+                      val needAuth = voiceLock && fromVoice && reply.toolCalls.any { it.first == "open_app" }
+                      if (needAuth) {
+                          append("Dost", "Fingerprint se confirm karo, phir app kholungi.")
+                          askFingerprint { ok ->
+                              if (ok) reply.toolCalls.forEach { (name, inp) -> Actions.run(this, name, inp) }
+                              else append("Dost", "Fingerprint match nahi hua, isliye app nahi khola.")
+                          }
+                      } else {
+                          reply.toolCalls.forEach { (name, inp) -> Actions.run(this, name, inp) }
+                      }
+
+                      var text = reply.text
+                      var mood = "neutral"
+                      val m = Regex("^\\s*\\[user:(\\w+)]\\s*").find(text)
+                      if (m != null) { mood = m.groupValues[1].lowercase(); text = text.removeRange(m.range).trim() }
+                      if (text.isBlank()) text = if (reply.toolCalls.isNotEmpty()) "Ho gaya!" else "Hmm, kuch samajh nahi aaya, phir bolo?"
+                      val finalMood = voiceMood ?: mood
+
+                      history.put(JSONObject().put("role", "assistant").put("content", text))
+                      runOnUiThread { moodView.text = moodEmoji(finalMood) }
+                      append("Dost", text)
+                      runOnUiThread { speak(text, finalMood) }
+                  } catch (e: Exception) {
+                      history.remove(history.length() - 1)
+                      append("Dost", "Oops, error aa gaya: ${e.message}")
+                      runOnUiThread { resumeIfHandsFree() }
+                  }
+              }
+
+              /** Voice lock ON ho to voice se app kholne se pehle fingerprint maangta hai (recording replay se bachne ke liye). */
+              private fun askFingerprint(onResult: (Boolean) -> Unit) {
+                  val done = AtomicBoolean(false)
+                  fun finish(ok: Boolean) { if (done.compareAndSet(false, true)) onResult(ok) }
+                  runOnUiThread {
+                      try {
+                          BiometricPrompt.Builder(this)
+                              .setTitle("Dost AI: confirm karo")
+                              .setNegativeButton("Cancel", mainExecutor) { _, _ -> finish(false) }
+                              .build()
+                              .authenticate(CancellationSignal(), mainExecutor, object : BiometricPrompt.AuthenticationCallback() {
+                                  override fun onAuthenticationSucceeded(r: BiometricPrompt.AuthenticationResult?) { finish(true) }
+                                  override fun onAuthenticationError(code: Int, msg: CharSequence?) { finish(false) }
+                              })
+                      } catch (e: Exception) { finish(false) }
+                  }
+              }
+
+              private fun moodEmoji(m: String) = when (m) {
+                  "happy" -> "😄"; "excited" -> "🤩"; "sad" -> "😢"
+                  "angry" -> "😠"; "stressed" -> "😰"; else -> "🙂"
+              }
+
+              private fun trimHistory() {
+                  while (history.length() > 20) history.remove(0)
+                  while (history.length() > 0 && history.getJSONObject(0).getString("role") != "user") history.remove(0)
+              }
+
+              private fun speak(t: String, mood: String) {
+                  val (pitch, rate) = when (mood) {
+                      "sad", "stressed" -> 1.0f to 0.9f
+                      "angry" -> 0.95f to 0.95f
+                      "happy", "excited" -> 1.2f to 1.1f
+                      else -> 1.1f to 1.0f
+                  }
+                  speaking = true
+                  tts?.setPitch(pitch)
+                  tts?.setSpeechRate(rate)
+                  tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, "dost")
+              }
+
+              override fun onDestroy() {
+                  handsFree = false
+                  capture.stop(); recognizer?.destroy(); tts?.shutdown(); super.onDestroy()
+              }
+          }
+          __EOF__
+          mkdir -p "app/src/main/res/values"
+          cat > "app/src/main/res/values/strings.xml" <<'__EOF__'
+          <resources>
+              <string name="lock_desc">Sirf voice command par screen lock karne ke liye.</string>
+          </resources>
+          __EOF__
+          mkdir -p "app/src/main/res/xml"
+          cat > "app/src/main/res/xml/accessibility_config.xml" <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeNotificationStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="false"
+              android:description="@string/lock_desc"
+              android:notificationTimeout="100" />
+          __EOF__
+          cat > "build.gradle.kts" <<'__EOF__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __EOF__
+          cat > "gradle.properties" <<'__EOF__'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          kotlin.code.style=official
+          __EOF__
+          cat > "settings.gradle.kts" <<'__EOF__'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "DostAI"
+          include(":app")
+          __EOF__
+
+      - name: Download voice models
+        run: |
+          mkdir -p app/src/main/assets
+          curl -L --fail -o app/src/main/assets/speaker.onnx \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+          pip install -q huggingface_hub
+          python - <<'PY'
+          import shutil
+          from huggingface_hub import hf_hub_download, list_repo_files
+          repo = "onnx-community/wav2vec2-emotion-recognition-ONNX"
+          files = list_repo_files(repo)
+          print(files)
+          onnx = [f for f in files if f.endswith(".onnx")]
+          pick = next((f for f in onnx if "quantized" in f), None) \
+              or next((f for f in onnx if f.endswith("model.onnx")), onnx[0])
+          print("using", pick)
+          shutil.copy(hf_hub_download(repo, pick), "app/src/main/assets/emotion.onnx")
+          shutil.copy(hf_hub_download(repo, "config.json"), "app/src/main/assets/emotion_config.json")
+          PY
+          ls -lh app/src/main/assets
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DostAI-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
