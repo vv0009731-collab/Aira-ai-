@@ -340,6 +340,209 @@ jobs:
 
               fun stop() {
                   running = false
+                  try { rec?.stop() } catch (e: Exception) {}
+                  try { rec?.release() } catch (e: Exception) {}
+                  rec = null
+              }
+          }
+          __EOF__
+          mkdir -p "app/src/main/java/com/vineet/dost"
+          cat > "app/src/main/java/com/vineet/dost/FaceView.kt" <<'__EOF__'
+          package com.vineet.dost
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PathMeasure
+          import android.graphics.RectF
+          import android.graphics.RadialGradient
+          import android.graphics.Shader
+          import android.view.View
+          import kotlin.math.PI
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sin
+          import kotlin.random.Random
+
+          /**
+           * Aira ka animated neon chehra. Emotion ke hisaab se aankhein, muh aur glow ka rang smoothly badalte hain.
+           * Pose = [upper eye: ax,ay,cx,cy,bx,by] [lower eye: ...] [mouth: x0,y0,cx,cy,x1,y1]  (left eye coordinates, right eye mirror)
+           */
+          class FaceView(ctx: Context) : View(ctx) {
+
+              companion object {
+                  private const val PIVOT = -170f
+
+                  private val POSES: Map<String, Pair<FloatArray, Int>> = mapOf(
+                      "happy" to (floatArrayOf(
+                          -346f, -228f, -250f, -215f, -137f, -124f,
+                          -346f, -66f, -250f, -90f, -137f, -124f,
+                          -327f, 114f, 0f, 608f, 327f, 114f) to 0xFF4FC3FF.toInt()),
+                      "neutral" to (floatArrayOf(
+                          -310f, -170f, -230f, -290f, -150f, -170f,
+                          -310f, -170f, -230f, -50f, -150f, -170f,
+                          -150f, 180f, 0f, 260f, 150f, 180f) to 0xFF4FC3FF.toInt()),
+                      "excited" to (floatArrayOf(
+                          -330f, -120f, -240f, -290f, -140f, -120f,
+                          -330f, -120f, -240f, -250f, -140f, -120f,
+                          -340f, 70f, 0f, 760f, 340f, 70f) to 0xFFFFC857.toInt()),
+                      "sad" to (floatArrayOf(
+                          -320f, -120f, -240f, -215f, -140f, -250f,
+                          -320f, -120f, -215f, -140f, -140f, -250f,
+                          -150f, 280f, 0f, 170f, 150f, 280f) to 0xFF6B8CFF.toInt()),
+                      "angry" to (floatArrayOf(
+                          -330f, -250f, -230f, -250f, -130f, -130f,
+                          -330f, -250f, -240f, -190f, -130f, -130f,
+                          -160f, 250f, 0f, 190f, 160f, 250f) to 0xFFFF5A5A.toInt()),
+                      "stressed" to (floatArrayOf(
+                          -310f, -190f, -230f, -320f, -150f, -190f,
+                          -310f, -190f, -230f, -40f, -150f, -190f,
+                          -130f, 235f, 0f, 205f, 130f, 250f) to 0xFFB87BFF.toInt()),
+                      "listening" to (floatArrayOf(
+                          -320f, -170f, -230f, -310f, -140f, -170f,
+                          -320f, -170f, -230f, -30f, -140f, -170f,
+                          -70f, 200f, 0f, 240f, 70f, 200f) to 0xFF3DE6C8.toInt())
+                  )
+              }
+
+              private val cur = POSES.getValue("happy").first.copyOf()
+              private var tgt = POSES.getValue("happy").first
+              private var cr = 79f; private var cg = 195f; private var cb = 255f
+              private var tr = 79f; private var tg = 195f; private var tb = 255f
+
+              private var emotion = "happy"
+              private var listening = false
+              private var thinking = false
+              private var talking = false
+              private var talkLerp = 0f
+              private var thinkLerp = 0f
+              private var stressLerp = 0f
+
+              private var nextBlink = 2f
+              private var blinkStart = -10f
+
+              private var bg: Bitmap? = null
+
+              private class Pulse(val pm: PathMeasure, val len: Float, val speed: Float, val phase: Float)
+              private val pulses = mutableListOf<Pulse>()
+              private val pos = FloatArray(2)
+              private var lineW = 2f
+              private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = P                val t = fb.size
+                      val flat = FloatArray(t * 80)
+                      for (i in 0 until t) System.arraycopy(fb[i], 0, flat, i * 80, 80)
+                      OnnxTensor.createTensor(env, FloatBuffer.wrap(flat), longArrayOf(1, t.toLong(), 80)).use { tensor ->
+                          s.run(mapOf(s.inputNames.first() to tensor)).use { r ->
+                              val v = r.get(0).value
+                              val e = if (v is Array<*>) v[0] as FloatArray else v as FloatArray
+                              l2(e)
+                          }
+                      }
+                  } catch (e: Throwable) { null }
+              }
+
+              /** Emotion: (label, probability). */
+              fun emotion(pcm: ShortArray): Pair<String, Float>? {
+                  val s = emo ?: return null
+                  if (labels.isEmpty() || pcm.size < 8000) return null
+                  return try {
+                      val n = minOf(pcm.size, 16000 * 10)
+                      val x = FloatArray(n) { pcm[pcm.size - n + it] / 32768f }
+                      var mean = 0f; for (v in x) mean += v; mean /= n
+                      var varr = 0f; for (v in x) varr += (v - mean) * (v - mean); varr /= n
+                      val inv = 1f / sqrt(varr + 1e-7f)
+                      for (i in x.indices) x[i] = (x[i] - mean) * inv
+                      OnnxTensor.createTensor(env, FloatBuffer.wrap(x), longArrayOf(1, n.toLong())).use { tensor ->
+                          s.run(mapOf(s.inputNames.first() to tensor)).use { r ->
+                              val logits = (r.get(0).value as Array<*>)[0] as FloatArray
+                              val mx = logits.max()
+                              val ex = logits.map { exp((it - mx).toDouble()).toFloat() }
+                              val sum = ex.sum()
+                              val best = ex.indices.maxByOrNull { ex[it] }!!
+                              labels.getOrElse(best) { "neutral" } to ex[best] / sum
+                          }
+                      }
+                  } catch (e: Throwable) { null }
+              }
+
+              fun cosine(a: FloatArray, b: FloatArray): Float {
+                  var d = 0f
+                  for (i in 0 until minOf(a.size, b.size)) d += a[i] * b[i]
+                  return d
+              }
+
+              fun l2(v: FloatArray): FloatArray {
+                  var n = 0f; for (x in v) n += x * x
+                  val s = 1f / sqrt(n + 1e-9f)
+                  return FloatArray(v.size) { v[it] * s }
+              }
+
+              /** Model ke label ko hamare mood mein badlo. */
+              fun toMood(label: String) = when (label) {
+                  "angry", "disgust" -> "angry"
+                  "fear", "fearful" -> "stressed"
+                  "happy" -> "happy"
+                  "surprise", "surprised" -> "excited"
+                  "sad" -> "sad"
+                  else -> "neutral"
+              }
+          }
+          __EOF__
+          mkdir -p "app/src/main/java/com/vineet/dost"
+          cat > "app/src/main/java/com/vineet/dost/AudioCapture.kt" <<'__EOF__'
+          package com.vineet.dost
+
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.MediaRecorder
+
+          /** Raw 16 kHz mono mic audio ko ring buffer mein rakhta hai (voice + emotion analysis ke liye). */
+          class AudioCapture {
+              private val sr = 16000
+              private val ring = ShortArray(sr * 15)
+              private var total = 0L
+              private var rec: AudioRecord? = null
+              @Volatile private var running = false
+
+              fun start(): Boolean {
+                  if (running) return true
+                  return try {
+                      val min = AudioRecord.getMinBufferSize(sr, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                      val r = AudioRecord(
+                          MediaRecorder.AudioSource.VOICE_RECOGNITION, sr,
+                          AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min, sr)
+                      )
+                      if (r.state != AudioRecord.STATE_INITIALIZED) { r.release(); return false }
+                      synchronized(ring) { total = 0L }
+                      rec = r
+                      r.startRecording()
+                      running = true
+                      Thread {
+                          val buf = ShortArray(1024)
+                          while (running) {
+                              val n = r.read(buf, 0, buf.size)
+                              if (n <= 0) { if (n < 0) break else continue }
+                              synchronized(ring) {
+                                  for (i in 0 until n) { ring[(total % ring.size).toInt()] = buf[i]; total++ }
+                              }
+                          }
+                      }.start()
+                      true
+                  } catch (e: Exception) { false }
+              }
+
+              /** Aakhri `seconds` second ki audio. */
+              fun snapshot(seconds: Float): ShortArray = synchronized(ring) {
+                  val want = minOf((seconds * sr).toInt(), ring.size, total.toInt())
+                  ShortArray(want) { i -> ring[((total - want + i) % ring.size).toInt()] }
+              }
+
+              fun stop() {
+                  running = false
                   try { rec?.stop() } catch (_: Exception) {}
                   try { rec?.release() } catch (_: Exception) {}
                   rec = null
