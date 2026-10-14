@@ -54,6 +54,9 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
               <queries>
@@ -63,7 +66,7 @@ jobs:
               </queries>
 
               <application
-                  android:label="Dost AI"
+                  android:label="Aira"
                   android:allowBackup="false"
                   android:theme="@android:style/Theme.Material.NoActionBar">
 
@@ -78,9 +81,14 @@ jobs:
                   </activity>
 
                   <service
+                      android:name=".ListenService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+
+                  <service
                       android:name=".LockService"
                       android:exported="false"
-                      android:label="Dost AI Screen Lock"
+                      android:label="Aira Screen Lock"
                       android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
                       <intent-filter>
                           <action android:name="android.accessibilityservice.AccessibilityService" />
@@ -164,7 +172,7 @@ jobs:
                       "locked"
                   } else {
                       start(ctx, Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                      "accessibility service off - opened settings so user can enable Dost AI Screen Lock"
+                      "accessibility service off - opened settings so user can enable Aira Screen Lock"
                   }
               }
           }
@@ -339,77 +347,322 @@ jobs:
           }
           __EOF__
           mkdir -p "app/src/main/java/com/vineet/dost"
-          cat > "app/src/main/java/com/vineet/dost/ClaudeClient.kt" <<'__EOF__'
+          cat > "app/src/main/java/com/vineet/dost/FaceView.kt" <<'__EOF__'
           package com.vineet.dost
 
-          import org.json.JSONArray
-          import org.json.JSONObject
-          import java.net.HttpURLConnection
-          import java.net.URL
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PathMeasure
+          import android.graphics.RectF
+          import android.graphics.RadialGradient
+          import android.graphics.Shader
+          import android.view.View
+          import kotlin.math.PI
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.sin
+          import kotlin.random.Random
 
-          class Reply(val text: String, val toolCalls: List<Pair<String, JSONObject>>)
+          /**
+           * Aira ka animated neon chehra. Emotion ke hisaab se aankhein, muh aur glow ka rang smoothly badalte hain.
+           * Pose = [upper eye: ax,ay,cx,cy,bx,by] [lower eye: ...] [mouth: x0,y0,cx,cy,x1,y1]  (left eye coordinates, right eye mirror)
+           */
+          class FaceView(ctx: Context) : View(ctx) {
 
-          object ClaudeClient {
+              companion object {
+                  private const val PIVOT = -170f
 
-              // Model yahan badal sakte ho (jaise "claude-haiku-5-5" = tez aur sasta)
-              const val MODEL = "claude-sonnet-5-5"
+                  private val POSES: Map<String, Pair<FloatArray, Int>> = mapOf(
+                      "happy" to (floatArrayOf(
+                          -346f, -228f, -250f, -215f, -137f, -124f,
+                          -346f, -66f, -250f, -90f, -137f, -124f,
+                          -327f, 114f, 0f, 608f, 327f, 114f) to 0xFF4FC3FF.toInt()),
+                      "neutral" to (floatArrayOf(
+                          -310f, -170f, -230f, -290f, -150f, -170f,
+                          -310f, -170f, -230f, -50f, -150f, -170f,
+                          -150f, 180f, 0f, 260f, 150f, 180f) to 0xFF4FC3FF.toInt()),
+                      "excited" to (floatArrayOf(
+                          -330f, -120f, -240f, -290f, -140f, -120f,
+                          -330f, -120f, -240f, -250f, -140f, -120f,
+                          -340f, 70f, 0f, 760f, 340f, 70f) to 0xFFFFC857.toInt()),
+                      "sad" to (floatArrayOf(
+                          -320f, -120f, -240f, -215f, -140f, -250f,
+                          -320f, -120f, -215f, -140f, -140f, -250f,
+                          -150f, 280f, 0f, 170f, 150f, 280f) to 0xFF6B8CFF.toInt()),
+                      "angry" to (floatArrayOf(
+                          -330f, -250f, -230f, -250f, -130f, -130f,
+                          -330f, -250f, -240f, -190f, -130f, -130f,
+                          -160f, 250f, 0f, 190f, 160f, 250f) to 0xFFFF5A5A.toInt()),
+                      "stressed" to (floatArrayOf(
+                          -310f, -190f, -230f, -320f, -150f, -190f,
+                          -310f, -190f, -230f, -40f, -150f, -190f,
+                          -130f, 235f, 0f, 205f, 130f, 250f) to 0xFFB87BFF.toInt()),
+                      "listening" to (floatArrayOf(
+                          -320f, -170f, -230f, -310f, -140f, -170f,
+                          -320f, -170f, -230f, -30f, -140f, -170f,
+                          -70f, 200f, 0f, 240f, 70f, 200f) to 0xFF3DE6C8.toInt())
+                  )
+              }
 
-              private const val SYSTEM = """
-          Tum "Dost" ho, Vineet ki personal AI dost. Hinglish (Hindi + English, Roman script) mein bilkul casual, warm aur thodi mazaakiya andaaz mein baat karti ho, jaise ek close dost. Jawab chhote rakho (1-3 vaakya) kyunki tumhari baat bolkar sunayi jaati hai. Emoji, markdown, bullet points mat use karo.
-          Jo user bole uska seedha, sahi jawab do. Zarurat ho to pyaar se pushback bhi karo.
-          Har jawab ki bilkul shuruaat mein ek tag likho: [user:mood] jahan mood in mein se ek ho: happy, excited, sad, angry, stressed, neutral. Ye user ke abhi ke mood ka tumhara andaza hai (uske shabdon aur [voice hint: ...] se, jo awaaz ki tezi/volume/speed batata hai). Tag ke baad apna jawab mood ke hisaab se do: sad ya stressed ho to naram aur care ke saath, angry ho to shaant rehkar, happy/excited ho to usi josh mein. [voice hint] ko kabhi bolkar mat padhna aur tag ke baare mein kuch mat kehna. Mood sirf andaza hai, pakka mat maan lena.
-          Jab user phone se kuch karwana chahe (app kholna, google search, gaana chalana, screen lock), to tool call karo aur saath mein ek chhoti friendly line bhi likho (jaise "Lo, khol diya!"). Tum screen unlock nahi kar sakti (Android security ki wajah se) - ye ho to dost ki tarah bata do ki phone ko haath se unlock karna padega.
-          """
+              private val cur = POSES.getValue("happy").first.copyOf()
+              private var tgt = POSES.getValue("happy").first
+              private var cr = 79f; private var cg = 195f; private var cb = 255f
+              private var tr = 79f; private var tg = 195f; private var tb = 255f
 
-              private val TOOLS = JSONArray(
-                  """
-          [
-           {"name":"open_app","description":"Phone mein koi app kholo, uske naam se.",
-            "input_schema":{"type":"object","properties":{"app_name":{"type":"string"}},"required":["app_name"]}},
-           {"name":"web_search","description":"Google par kuch search karo.",
-            "input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}},
-           {"name":"play_music","description":"Koi gaana ya artist chalao.",
-            "input_schema":{"type":"object","properties":{"song":{"type":"string"}},"required":["song"]}},
-           {"name":"lock_screen","description":"Phone ki screen lock karo.",
-            "input_schema":{"type":"object","properties":{}}}
-          ]
-          """
-              )
+              private var emotion = "happy"
+              private var listening = false
+              private var thinking = false
+              private var talking = false
+              private var talkLerp = 0f
+              private var thinkLerp = 0f
+              private var stressLerp = 0f
 
-              fun chat(apiKey: String, history: JSONArray): Reply {
-                  val body = JSONObject()
-                      .put("model", MODEL)
-                      .put("max_tokens", 400)
-                      .put("system", SYSTEM.trim())
-                      .put("tools", TOOLS)
-                      .put("messages", history)
+              private var nextBlink = 2f
+              private var blinkStart = -10f
 
-                  val conn = (URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection)
-                  conn.requestMethod = "POST"
-                  conn.connectTimeout = 15000
-                  conn.readTimeout = 60000
-                  conn.doOutput = true
-                  conn.setRequestProperty("content-type", "application/json")
-                  conn.setRequestProperty("x-api-key", apiKey)
-                  conn.setRequestProperty("anthropic-version", "2023-06-01")
-                  conn.outputStream.use { it.write(body.toString().toByteArray()) }
+              private var bg: Bitmap? = null
 
-                  val code = conn.responseCode
-                  val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-                  val raw = stream.bufferedReader().readText()
-                  if (code !in 200..299) throw RuntimeException("API error $code: $raw")
+              private class Pulse(val pm: PathMeasure, val len: Float, val speed: Float, val phase: Float)
+              private val pulses = mutableListOf<Pulse>()
+              private val pos = FloatArray(2)
+              private var lineW = 2f
+              private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeCap = Paint.Cap.ROUND
+                  strokeJoin = Paint.Join.ROUND
+              }
+              private val eyeL = Path()
+              private val eyeR = Path()
+              private val mouth = Path()
 
-                  val content = JSONObject(raw).getJSONArray("content")
-                  val sb = StringBuilder()
-                  val calls = mutableListOf<Pair<String, JSONObject>>()
-                  for (i in 0 until content.length()) {
-                      val b = content.getJSONObject(i)
-                      when (b.getString("type")) {
-                          "text" -> sb.append(b.getString("text"))
-                          "tool_use" -> calls.add(b.getString("name") to b.getJSONObject("input"))
+              fun setEmotion(m: String) { emotion = if (POSES.containsKey(m)) m else "neutral"; retarget() }
+              fun setListening(b: Boolean) { listening = b; retarget() }
+              fun setThinking(b: Boolean) { thinking = b }
+              fun setTalking(b: Boolean) { talking = b }
+
+              private fun retarget() {
+                  val key = if (listening) "listening" else emotion
+                  val (pose, color) = POSES.getValue(key)
+                  tgt = pose
+                  tr = Color.red(color).toFloat(); tg = Color.green(color).toFloat(); tb = Color.blue(color).toFloat()
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+                  super.onSizeChanged(w, h, ow, oh)
+                  if (w > 0 && h > 0) bg = buildBackground(w, h)
+              }
+
+              /** Circuit-board background: chips, pins, parallel trace bundles, glowing lines (ek baar banta hai). */
+              private fun buildBackground(w: Int, h: Int): Bitmap {
+                  pulses.clear()
+                  val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(bmp)
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  p.shader = RadialGradient(
+                      w / 2f, h * 0.32f, max(w, h) * 0.85f,
+                      intArrayOf(0xFF0B2A52.toInt(), 0xFF071426.toInt(), 0xFF03080F.toInt()),
+                      floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP
+                  )
+                  c.drawRect(0f, 0f, w.toFloat(), h.toFloat(), p)
+                  p.shader = null
+
+                  val rnd = Random(7)
+                  val g = w / 18f
+                  val rows = (h / g).toInt() + 1
+                  val line = max(1.6f, w / 330f)
+                  lineW = line
+                  val faceRect = RectF(w * 0.12f, h * 0.10f, w * 0.88f, h * 0.58f)
+                  val blue = 0x4FA3FF
+
+                  fun argb(a: Int, rgb: Int = blue) = (a shl 24) or rgb
+
+                  fun glowPath(path: Path, a: Int, wid: Float) {
+                      p.style = Paint.Style.STROKE
+                      p.color = argb(a / 6); p.strokeWidth = wid * 5f; c.drawPath(path, p)
+                      p.color = argb(a / 3); p.strokeWidth = wid * 2.6f; c.drawPath(path, p)
+                      p.color = argb(a); p.strokeWidth = wid; c.drawPath(path, p)
+                  }
+                  fun ring(x: Float, y: Float, a: Int) {
+                      p.style = Paint.Style.STROKE; p.strokeWidth = line; p.color = argb(a)
+                      c.drawCircle(x, y, g * 0.17f, p)
+                  }
+                  fun addPulse(path: Path) {
+                      val pm = PathMeasure(path, false)
+                      if (pm.length > g) pulses.add(Pulse(pm, pm.length, 0.05f + rnd.nextFloat() * 0.07f, rnd.nextFloat()))
+                  }
+                  fun randomTrace(x0: Float, y0: Float): Pair<Path, FloatArray> {
+                      var x = x0; var y = y0
+                      val path = Path(); path.moveTo(x, y)
+                      var horiz = rnd.nextBoolean()
+                      repeat(2 + rnd.nextInt(4)) {
+                          val len = (1 + rnd.nextInt(3)) * g
+                          val dir = if (rnd.nextBoolean()) 1f else -1f
+                          if (horiz) x += dir * len else y += dir * len
+                          path.lineTo(x, y)
+                          if (rnd.nextInt(3) == 0) { x += dir * g * 0.5f; y += dir * g * 0.5f; path.lineTo(x, y) }
+                          horiz = !horiz
+                      }
+                      return path to floatArrayOf(x, y)
+                  }
+
+                  // 1) halki traces poore background mein
+                  repeat(70) {
+                      val (path, end) = randomTrace(rnd.nextInt(19) * g, rnd.nextInt(rows) * g)
+                      p.style = Paint.Style.STROKE; p.strokeWidth = line; p.color = argb(0x30)
+                      c.drawPath(path, p)
+                      p.style = Paint.Style.FILL; p.color = argb(0x40)
+                      c.drawCircle(end[0], end[1], line * 2f, p)
+                  }
+
+                  // 2) chips (pins ke saath), chehre se door
+                  var placed = 0
+                  var tries = 0
+                  while (placed < 9 && tries < 80) {
+                      tries++
+                      val cw = (2 + rnd.nextInt(3)) * g
+                      val ch = (2 + rnd.nextInt(3)) * g
+                      val x = rnd.nextInt(16) * g
+                      val y = rnd.nextInt(max(1, rows - 4)) * g
+                      val r = RectF(x, y, x + cw, y + ch)
+                      if (RectF.intersects(r, faceRect)) continue
+                      placed++
+                      p.style = Paint.Style.FILL; p.color = argb(0x2A, 0x1A5CA8); c.drawRect(r, p)
+                      p.style = Paint.Style.STROKE; p.strokeWidth = line; p.color = argb(0x66); c.drawRect(r, p)
+                      val inset = g * 0.4f
+                      p.color = argb(0x33)
+                      c.drawRect(r.left + inset, r.top + inset, r.right - inset, r.bottom - inset, p)
+                      p.color = argb(0x88); p.strokeWidth = line * 0.8f
+                      var px = r.left + g * 0.3f
+                      while (px < r.right - g * 0.2f) {
+                          c.drawLine(px, r.top - g * 0.22f, px, r.top, p)
+                          c.drawLine(px, r.bottom, px, r.bottom + g * 0.22f, p)
+                          px += g * 0.3f
+                      }
+                      var py = r.top + g * 0.3f
+                      while (py < r.bottom - g * 0.2f) {
+                          c.drawLine(r.left - g * 0.22f, py, r.left, py, p)
+                          c.drawLine(r.right, py, r.right + g * 0.22f, py, p)
+                          py += g * 0.3f
                       }
                   }
-                  return Reply(sb.toString().trim(), calls)
+
+                  // 3) parallel trace bundles (kinaron par), 45 degree jog ke saath
+                  fun bundle(x0: Float, dir: Float, yStart: Float, y1: Float, y2: Float, count: Int, a: Int) {
+                      val gap = line * 3.6f
+                      val shift = w * 0.03f
+                      for (i in 0 until count) {
+                          val x = x0 + dir * i * gap
+                          val path = Path()
+                          path.moveTo(x, yStart)
+                          path.lineTo(x, y1)
+                          path.lineTo(x + dir * shift, y1 + shift)
+                          path.lineTo(x + dir * shift, y2)
+                          glowPath(path, a, line)
+                          if (i % 3 == 0) ring(x + dir * shift, y2, a)
+                          if (i % 2 == 0) addPulse(path)
+                      }
+                  }
+                  bundle(w * 0.86f, 1f, h * 0.20f, h * 0.38f, h * 0.66f, 7, 0xA0)
+                  bundle(w * 0.14f, -1f, h * 0.44f, h * 0.55f, h * 0.80f, 6, 0x70)
+
+                  // 4) chamakti hui traces (chehre ke area se bahar)
+                  var made = 0
+                  var t2 = 0
+                  while (made < 16 && t2 < 120) {
+                      t2++
+                      val (path, end) = randomTrace(rnd.nextInt(19) * g, rnd.nextInt(rows) * g)
+                      val b = RectF()
+                      path.computeBounds(b, true)
+                      if (RectF.intersects(b, faceRect)) continue
+                      made++
+                      glowPath(path, 0xA0, line)
+                      ring(end[0], end[1], 0xB0)
+                      if (made % 2 == 0) addPulse(path)
+                  }
+                  return bmp
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  bg?.let { canvas.drawBitmap(it, 0f, 0f, null) }
+
+                  val now = System.nanoTime() / 1_000_000_000f
+
+                  // traces par chalte hue data-pulses
+                  for (pl in pulses) {
+                      val d = ((now * pl.speed + pl.phase) % 1f) * pl.len
+                      if (pl.pm.getPosTan(d, pos, null)) {
+                          fill.color = 0x224FA3FF; canvas.drawCircle(pos[0], pos[1], lineW * 5f, fill)
+                          fill.color = 0x554FA3FF; canvas.drawCircle(pos[0], pos[1], lineW * 3f, fill)
+                          fill.color = 0xF0D8EEFF.toInt(); canvas.drawCircle(pos[0], pos[1], lineW * 1.4f, fill)
+                      }
+                  }
+
+                  // smooth animation toward target pose / colour
+                  for (i in cur.indices) cur[i] += (tgt[i] - cur[i]) * 0.14f
+                  cr += (tr - cr) * 0.12f; cg += (tg - cg) * 0.12f; cb += (tb - cb) * 0.12f
+                  talkLerp += ((if (talking) 1f else 0f) - talkLerp) * 0.2f
+                  thinkLerp += ((if (thinking) 1f else 0f) - thinkLerp) * 0.15f
+                  stressLerp += ((if (emotion == "stressed" && !listening) 1f else 0f) - stressLerp) * 0.1f
+
+                  // blink
+                  if (now >= nextBlink) { blinkStart = now; nextBlink = now + 2.5f + Random.nextFloat() * 3f }
+                  val bp = (now - blinkStart) / 0.16f
+                  val bs = if (bp in 0f..1f) 1f - 0.92f * sin(PI.toFloat() * bp) else 1f
+
+                  val s = min(w, h * 0.8f) / 1000f * 0.95f
+                  val bob = sin(now * 1.6f) * 8f * s
+                  val shake = sin(now * 45f) * 5f * s * stressLerp
+                  val cx = w / 2f + shake
+                  val cy = h * 0.32f + bob
+                  val gaze = sin(now * 2.2f) * 35f * thinkLerp   // thinking: aankhein idhar-udhar
+
+                  fun X(x: Float, sign: Float) = cx + (sign * x + gaze) * s
+                  fun EY(y: Float) = cy + (PIVOT + (y - PIVOT) * bs) * s
+
+                  fun eye(path: Path, sign: Float) {
+                      path.reset()
+                      path.moveTo(X(cur[0], sign), EY(cur[1]))
+                      path.quadTo(X(cur[2], sign), EY(cur[3]), X(cur[4], sign), EY(cur[5]))
+                      path.moveTo(X(cur[6], sign), EY(cur[7]))
+                      path.quadTo(X(cur[8], sign), EY(cur[9]), X(cur[10], sign), EY(cur[11]))
+                  }
+                  eye(eyeL, 1f)
+                  eye(eyeR, -1f)
+
+                  // mouth (talking: khulta-band hota hai)
+                  val open = (sin(now * 12f) * 0.5f + 0.5f) * 120f * talkLerp
+                  mouth.reset()
+                  mouth.moveTo(cx + cur[12] * s, cy + cur[13] * s)
+                  mouth.quadTo(cx + cur[14] * s, cy + (cur[15] + open) * s, cx + cur[16] * s, cy + cur[17] * s)
+
+                  val pulse = if (listening) 0.8f + 0.35f * sin(now * 6f) else 1f
+                  val r = cr.toInt().coerceIn(0, 255)
+                  val g = cg.toInt().coerceIn(0, 255)
+                  val b = cb.toInt().coerceIn(0, 255)
+
+                  for (path in arrayOf(eyeL, eyeR, mouth)) glowStroke(canvas, path, s, pulse, r, g, b)
+
+                  postInvalidateOnAnimation()
+              }
+
+              private fun glowStroke(canvas: Canvas, path: Path, s: Float, pulse: Float, r: Int, g: Int, b: Int) {
+                  val widths = floatArrayOf(78f, 56f, 38f, 26f)
+                  val alphas = intArrayOf(26, 38, 58, 90)
+                  for (i in widths.indices) {
+                      paint.strokeWidth = widths[i] * s
+                      paint.color = Color.argb(min(255, (alphas[i] * pulse).toInt()), r, g, b)
+                      canvas.drawPath(path, paint)
+                  }
+                  paint.strokeWidth = 17f * s
+                  paint.color = 0xFFF4FAFF.toInt()
+                  canvas.drawPath(path, paint)
               }
           }
           __EOF__
@@ -418,7 +671,7 @@ jobs:
           package com.vineet.dost
 
           import kotlin.math.PI
-                    import kotlin.math.cos
+          import kotlin.math.cos
           import kotlin.math.ln
           import kotlin.math.sin
 
@@ -531,6 +784,200 @@ jobs:
           }
           __EOF__
           mkdir -p "app/src/main/java/com/vineet/dost"
+          cat > "app/src/main/java/com/vineet/dost/GeminiClient.kt" <<'__EOF__'
+          package com.vineet.dost
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class Reply(val text: String, val toolCalls: List<Pair<String, JSONObject>>)
+
+          /** Google Gemini API (free tier) client with function calling. */
+          object GeminiClient {
+
+              // Model yahan badal sakte ho, jaise "gemini-2.5-flash" (zyada smart, limit kam)
+              const val MODEL = "gemini-2.5-flash-lite"
+
+              private const val SYSTEM = """
+          Tum "Aira" ho, Vineet ki personal AI dost. Hinglish (Hindi + English, Roman script) mein bilkul casual, warm aur thodi mazaakiya andaaz mein baat karti ho, jaise ek close dost. Jawab chhote rakho (1-3 vaakya) kyunki tumhari baat bolkar sunayi jaati hai. Emoji, markdown, bullet points mat use karo.
+          Jo user bole uska seedha, sahi jawab do. Zarurat ho to pyaar se pushback bhi karo.
+          Har jawab ki bilkul shuruaat mein ek tag likho: [user:mood] jahan mood in mein se ek ho: happy, excited, sad, angry, stressed, neutral. Ye user ke abhi ke mood ka tumhara andaza hai (uske shabdon aur [voice hint: ...] se, jo awaaz ki tezi/volume/speed batata hai). Tag ke baad apna jawab mood ke hisaab se do: sad ya stressed ho to naram aur care ke saath, angry ho to shaant rehkar, happy/excited ho to usi josh mein. [voice hint] ko kabhi bolkar mat padhna aur tag ke baare mein kuch mat kehna. Mood sirf andaza hai, pakka mat maan lena.
+          Jab user phone se kuch karwana chahe (app kholna, google search, gaana chalana, screen lock), to tool call karo aur saath mein ek chhoti friendly line bhi likho (jaise "Lo, khol diya!"). Tum screen unlock nahi kar sakti (Android security ki wajah se) - ye ho to dost ki tarah bata do ki phone ko haath se unlock karna padega.
+          """
+
+              private fun str(desc: String) = JSONObject().put("type", "STRING").put("description", desc)
+
+              private fun fn(name: String, desc: String, param: String?, pdesc: String = ""): JSONObject {
+                  val f = JSONObject().put("name", name).put("description", desc)
+                  if (param != null) {
+                      f.put("parameters", JSONObject()
+                          .put("type", "OBJECT")
+                          .put("properties", JSONObject().put(param, str(pdesc)))
+                          .put("required", JSONArray().put(param)))
+                  }
+                  return f
+              }
+
+              private val TOOLS = JSONArray().put(
+                  JSONObject().put("functionDeclarations", JSONArray()
+                      .put(fn("open_app", "Phone mein koi app kholo, uske naam se.", "app_name", "App ka naam"))
+                      .put(fn("web_search", "Google par kuch search karo.", "query", "Search query"))
+                      .put(fn("play_music", "Koi gaana ya artist chalao.", "song", "Gaane ya artist ka naam"))
+                      .put(fn("lock_screen", "Phone ki screen lock karo.", null))
+                  )
+              )
+
+              /** history: [{"role":"user"|"assistant","content":"text"}, ...] */
+              fun chat(apiKey: String, history: JSONArray): Reply {
+                  val contents = JSONArray()
+                  for (i in 0 until history.length()) {
+                      val m = history.getJSONObject(i)
+                      contents.put(JSONObject()
+                          .put("role", if (m.getString("role") == "assistant") "model" else "user")
+                          .put("parts", JSONArray().put(JSONObject().put("text", m.getString("content")))))
+                  }
+                  val body = JSONObject()
+                      .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM.trim()))))
+                      .put("contents", contents)
+                      .put("tools", TOOLS)
+                      .put("generationConfig", JSONObject().put("maxOutputTokens", 400))
+
+                  val url = "https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent"
+                  val conn = URL(url).openConnection() as HttpURLConnection
+                  conn.requestMethod = "POST"
+                  conn.connectTimeout = 15000
+                  conn.readTimeout = 60000
+                  conn.doOutput = true
+                  conn.setRequestProperty("content-type", "application/json")
+                  conn.setRequestProperty("x-goog-api-key", apiKey)
+                  conn.outputStream.use { it.write(body.toString().toByteArray()) }
+
+                  val code = conn.responseCode
+                  val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                  val raw = stream.bufferedReader().readText()
+                  if (code == 429) throw RuntimeException("Free limit poori ho gayi, 1 minute baad dobara bolo.")
+                  if (code !in 200..299) throw RuntimeException("API error $code: ${raw.take(300)}")
+
+                  val cands = JSONObject(raw).optJSONArray("candidates")
+                  val parts = cands?.optJSONObject(0)?.optJSONObject("content")?.optJSONArray("parts") ?: JSONArray()
+                  val sb = StringBuilder()
+                  val calls = mutableListOf<Pair<String, JSONObject>>()
+                  for (i in 0 until parts.length()) {
+                      val p = parts.getJSONObject(i)
+                      if (p.has("text")) sb.append(p.getString("text"))
+                      p.optJSONObject("functionCall")?.let { fc ->
+                          calls.add(fc.getString("name") to (fc.optJSONObject("args") ?: JSONObject()))
+                      }
+                  }
+                  return Reply(sb.toString().trim(), calls)
+              }
+          }
+          __EOF__
+          mkdir -p "app/src/main/java/com/vineet/dost"
+          cat > "app/src/main/java/com/vineet/dost/ListenService.kt" <<'__EOF__'
+          package com.vineet.dost
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+
+          /** Hands-free ON ho to app ko background mein zinda rakhta hai (mic foreground service + notification). */
+          class ListenService : Service() {
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val ch = "aira_listen"
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(ch, "Aira listening", NotificationManager.IMPORTANCE_LOW))
+                  val pi = PendingIntent.getActivity(
+                      this, 0,
+                      Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(this, ch)
+                      .setContentTitle("Aira sun rahi hai")
+                      .setContentText("\"Aira, ...\" bolke bulao")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+                  try {
+                      if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                      else startForeground(1, n)
+                  } catch (e: Exception) { stopSelf() }
+                  return START_NOT_STICKY
+              }
+          }
+          __EOF__
+          mkdir -p "app/src/main/java/com/vineet/dost"
+          cat > "app/src/main/java/com/vineet/dost/LocalBrain.kt" <<'__EOF__'
+          package com.vineet.dost
+
+          import org.json.JSONObject
+
+          /** Demo mode: bina API key ke chhote-mote jawab aur phone ke kaam (Claude ki jagah). */
+          object LocalBrain {
+
+              private fun clean(t: String, vararg words: String): String {
+                  var s = " $t "
+                  for (w in words) s = s.replace(Regex("(?i)\\s${Regex.escape(w)}(?=\\s)"), " ")
+                  return s.trim().replace(Regex("\\s+"), " ")
+              }
+
+              fun reply(raw: String): Reply {
+                  val t = raw.lowercase().trim().replace(Regex("[?!.,]"), " ").replace(Regex("\\s+"), " ")
+                  fun has(vararg k: String) = k.any { t.contains(it) }
+
+                  if (has("lock", "लॉक"))
+                      return Reply("Lo, screen lock kar rahi hoon!", listOf("lock_screen" to JSONObject()))
+
+                  if (has("kholo", "khol do", "khol de", "open", "खोलो")) {
+                      val app = clean(t, "kholo", "khol", "do", "de", "open", "karo", "app", "ko", "please", "mujhe", "ek", "खोलो")
+                      if (app.isNotBlank())
+                          return Reply("Lo, $app khol rahi hoon!", listOf("open_app" to JSONObject().put("app_name", app)))
+                  }
+
+                  if (has("search", "google", "dhundo", "khojo", "dhoondo")) {
+                      val q = clean(t, "search", "google", "karo", "kar", "do", "dhundo", "khojo", "dhoondo", "par", "pe", "mein", "me", "ko", "please", "mujhe")
+                      return Reply("Google par dhundh rahi hoon!", listOf("web_search" to JSONObject().put("query", q.ifBlank { raw })))
+                  }
+
+                  if (has("gaana", "gana", "song", "music", "chalao", "chala do", "play", "sunao")) {
+                      val song = clean(t, "gaana", "gana", "song", "music", "chalao", "chala", "do", "play", "karo", "ek", "koi", "mujhe", "sunao", "ka", "ki", "ke")
+                      return Reply("Ye lo, gaana chala rahi hoon!", listOf("play_music" to JSONObject().put("song", song.ifBlank { "latest hindi songs" })))
+                  }
+
+                  val text = when {
+                      has("kaisi ho", "kaise ho", "kya haal", "how are you") ->
+                          "Main ekdum mast hoon! Tum batao, aaj ka din kaisa gaya?"
+                      has("hello", "hii", "hey", "namaste", "hi ") || t == "hi" ->
+                          "Heyy! Bolo bolo, kya chal raha hai?"
+                      has("udaas", "dukhi", "sad", "bura lag", "rona") ->
+                          "Arre, kya hua? Main yahin hoon, aaram se batao."
+                      has("khush", "happy", "mast", "maza") ->
+                          "Wah! Sunke achha laga, party to banti hai!"
+                      has("naam", "kaun ho", "who are you") ->
+                          "Main tumhari dost Aira hoon. Abhi demo mode mein hoon, key daaloge to pura dimaag chalega!"
+                      has("thank", "shukriya", "dhanyavad") ->
+                          "Arre yaar, isme thank you kaisa! 😄"
+                      has("bye", "alvida", "chalta hoon") ->
+                          "Chalo phir milte hain, apna khayal rakhna!"
+                      else ->
+                          "Demo mode mein hoon, to main sirf app kholna, search, gaana aur lock kar sakti hoon. Asli baat-cheet ke liye API key daalo!"
+                  }
+                  return Reply(text, emptyList())
+              }
+          }
+          __EOF__
+          mkdir -p "app/src/main/java/com/vineet/dost"
           cat > "app/src/main/java/com/vineet/dost/LockService.kt" <<'__EOF__'
           package com.vineet.dost
 
@@ -563,8 +1010,10 @@ jobs:
           import android.content.pm.PackageManager
           import android.graphics.Color
           import android.hardware.biometrics.BiometricPrompt
+          import android.media.AudioManager
           import android.os.CancellationSignal
           import java.util.concurrent.atomic.AtomicBoolean
+          import android.os.Build
           import android.os.Bundle
           import android.os.Handler
           import android.os.Looper
@@ -586,6 +1035,11 @@ jobs:
               companion object {
                   /** Awaaz match threshold (0-1). Status line mein score dikhta hai, usse tune karo. */
                   const val SPEAKER_THRESHOLD = 0.5f
+
+                  /** Wake word: "Aira" (aur STT ke alag-alag spellings), purana "dost" bhi chalega. */
+                  private val WAKE = Regex(
+                      "(?i)(?<![\\p{L}])(hey |hi |ok |ए )?(aira|ayra|aayra|airah|aera|era|ira|ayra|dost|आइरा|ऐरा|आयरा|एरा|इरा|आईरा|दोस्त)(?![\\p{L}])[,!]? ?"
+                  )
               }
 
               private lateinit var chatView: TextView
@@ -594,7 +1048,8 @@ jobs:
               private lateinit var micBtn: Button
               private lateinit var handsBtn: Button
               private lateinit var lockBtn: Button
-              private lateinit var moodView: TextView
+              private lateinit var face: FaceView
+              private val idleRunnable = Runnable { face.setEmotion("happy") }
               private lateinit var statusView: TextView
               private var tts: TextToSpeech? = null
               private var recognizer: SpeechRecognizer? = null
@@ -622,15 +1077,15 @@ jobs:
                   }
                   tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                       override fun onStart(id: String?) {}
-                      override fun onError(id: String?) { speaking = false; runOnUiThread { resumeIfHandsFree() } }
-                      override fun onDone(id: String?) { speaking = false; runOnUiThread { resumeIfHandsFree() } }
+                      override fun onError(id: String?) { speaking = false; runOnUiThread { face.setTalking(false); idleSoon(); resumeIfHandsFree() } }
+                      override fun onDone(id: String?) { speaking = false; runOnUiThread { face.setTalking(false); idleSoon(); resumeIfHandsFree() } }
                   })
 
                   if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS), 1)
                   }
                   if (apiKey().isBlank()) askApiKey()
-                  append("Dost", "Heyy! Bolo, kya chal raha hai? 😄")
+                  append("Aira", if (apiKey().isBlank()) "Heyy! Demo mode ON hai (bina key). Bolo: \"youtube kholo\", \"arijit ka gaana chalao\", \"cricket score search karo\" ya \"phone lock karo\" 😄" else "Heyy! Bolo, kya chal raha hai? 😄")
 
                   status("Voice models load ho rahe hain...")
                   Thread {
@@ -647,16 +1102,18 @@ jobs:
 
               // ---------- UI ----------
               private fun buildUi() {
+                  val frame = FrameLayout(this)
+                  face = FaceView(this)
+                  face.setOnClickListener { toggleMic() }
+                  frame.addView(face, FrameLayout.LayoutParams(-1, -1))
+
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
-                      setBackgroundColor(Color.parseColor("#0F0F14"))
                       setPadding(24, 48, 24, 24)
                   }
                   val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-                  top.addView(TextView(this).apply { text = "Dost AI"; textSize = 22f; setTextColor(Color.WHITE) },
+                  top.addView(TextView(this).apply { text = "Aira"; textSize = 22f; setTextColor(Color.WHITE) },
                       LinearLayout.LayoutParams(0, -2, 1f))
-                  moodView = TextView(this).apply { text = "🙂"; textSize = 24f }
-                  top.addView(moodView)
                   top.addView(Button(this).apply { text = "Key"; textSize = 11f; setOnClickListener { askApiKey() } })
                   root.addView(top)
 
@@ -672,12 +1129,17 @@ jobs:
                   statusView = TextView(this).apply { textSize = 11f; setTextColor(Color.parseColor("#9AA0A6")) }
                   root.addView(statusView)
 
-                  scroll = ScrollView(this)
+                  // khaali jagah: yahan chehra dikhta hai (chehre par tap = mic)
+                  root.addView(View(this), LinearLayout.LayoutParams(-1, 0, 1f))
+
+                  scroll = ScrollView(this).apply {
+                      setBackgroundColor(Color.parseColor("#B30A1220")); setPadding(16, 8, 16, 8)
+                  }
                   chatView = TextView(this).apply {
                       textSize = 16f; setTextColor(Color.parseColor("#EDEDED")); setLineSpacing(0f, 1.2f)
                   }
                   scroll.addView(chatView)
-                  root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+                  root.addView(scroll, LinearLayout.LayoutParams(-1, (resources.displayMetrics.heightPixels * 0.28f).toInt()))
 
                   val bottom = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
                   input = EditText(this).apply {
@@ -690,7 +1152,9 @@ jobs:
                   micBtn = Button(this).apply { text = "🎤"; setOnClickListener { toggleMic() } }
                   bottom.addView(micBtn)
                   root.addView(bottom)
-                  setContentView(root)
+
+                  frame.addView(root, FrameLayout.LayoutParams(-1, -1))
+                  setContentView(frame)
               }
 
               private fun append(who: String, msg: String) = runOnUiThread {
@@ -700,15 +1164,16 @@ jobs:
 
               // ---------- API key + prefs ----------
               private fun prefs() = getSharedPreferences("dost", MODE_PRIVATE)
-              private fun apiKey() = prefs().getString("key", "") ?: ""
+              private fun apiKey() = prefs().getString("gemini_key", "") ?: ""
 
               private fun askApiKey() {
-                  val et = EditText(this).apply { hint = "sk-ant-..."; setText(apiKey()) }
+                  val et = EditText(this).apply { hint = "AIza..."; setText(apiKey()) }
                   AlertDialog.Builder(this)
-                      .setTitle("Anthropic API Key")
-                      .setMessage("Ye key sirf tumhare phone mein save hoti hai.")
+                      .setTitle("Gemini API Key")
+                      .setMessage("aistudio.google.com se free key banao. Ye key sirf tumhare phone mein save hoti hai.")
                       .setView(et)
-                      .setPositiveButton("Save") { _, _ -> prefs().edit().putString("key", et.text.toString().trim()).apply() }
+                      .setPositiveButton("Save") { _, _ -> prefs().edit().putString("gemini_key", et.text.toString().trim()).apply() }
+                      .setNegativeButton("Demo mode", null)
                       .show()
               }
 
@@ -719,7 +1184,7 @@ jobs:
 
               // ---------- Voice enroll ----------
               private fun enroll() {
-                  if (!Analyzer.spkReady) { append("Dost", "Speaker model load nahi hua, isliye enroll nahi ho sakta."); return }
+                  if (!Analyzer.spkReady) { append("Aira", "Speaker model load nahi hua, isliye enroll nahi ho sakta."); return }
                   if (enrolling) return
                   setHandsFree(false)
                   recognizer?.cancel(); listening = false; capture.stop(); tts?.stop()
@@ -727,58 +1192,85 @@ jobs:
                   val prompts = listOf(
                       "Mera naam Vineet hai aur main apne phone se baat kar raha hoon.",
                       "Aaj mausam bahut accha hai, chalo kuch gaana chalate hain.",
-                      "Dost, mujhe kal subah saat baje uthna hai."
+                      "Aira, mujhe kal subah saat baje uthna hai."
                   )
                   Thread {
                       val embs = mutableListOf<FloatArray>()
                       for ((idx, p) in prompts.withIndex()) {
-                          append("Dost", "Enroll ${idx + 1}/3: abhi 5 second tak ye bolo (ya kuch bhi natural bolo):\n\"$p\"")
+                          append("Aira", "Enroll ${idx + 1}/3: abhi 5 second tak ye bolo (ya kuch bhi natural bolo):\n\"$p\"")
                           Thread.sleep(1500)
-                          if (!capture.start()) { append("Dost", "Mic start nahi hua."); enrolling = false; return@Thread }
+                          if (!capture.start()) { append("Aira", "Mic start nahi hua."); enrolling = false; return@Thread }
                           Thread.sleep(5500)
                           val pcm = capture.snapshot(5f)
                           capture.stop()
                           if (pcm.isEmpty() || pcm.maxOf { abs(it.toInt()) } < 100) {
-                              append("Dost", "Awaaz sunai nahi di, mic permission check karo aur dobara try karo.")
+                              append("Aira", "Awaaz sunai nahi di, mic permission check karo aur dobara try karo.")
                               enrolling = false; return@Thread
                           }
                           Analyzer.embedding(pcm)?.let { embs.add(it) }
                       }
-                      if (embs.size < 2) { append("Dost", "Enroll fail ho gaya, dobara try karo."); enrolling = false; return@Thread }
+                      if (embs.size < 2) { append("Aira", "Enroll fail ho gaya, dobara try karo."); enrolling = false; return@Thread }
                       val sum = FloatArray(embs[0].size)
                       for (e in embs) for (i in sum.indices) sum[i] += e[i]
                       val vp = Analyzer.l2(sum)
                       prefs().edit().putString("voiceprint", vp.joinToString(",")).apply()
-                      append("Dost", "Done! Tumhari awaaz save ho gayi. Ab \"Voice lock\" ON karke dekho.")
+                      append("Aira", "Done! Tumhari awaaz save ho gayi. Ab \"Voice lock\" ON karke dekho.")
                       status(modelStatus())
                       enrolling = false
                   }.start()
               }
 
               private fun toggleVoiceLock() {
-                  if (!voiceLock && enrolled() == null) { append("Dost", "Pehle \"Awaaz enroll\" karo."); return }
+                  if (!voiceLock && enrolled() == null) { append("Aira", "Pehle \"Awaaz enroll\" karo."); return }
                   voiceLock = !voiceLock
                   lockBtn.text = if (voiceLock) "Voice lock: ON" else "Voice lock: OFF"
-                  if (voiceLock) append("Dost", "Voice lock ON. Mic se sirf tumhari awaaz par kaam karungi (type karke bologe to chalega). Voice se app kholne se pehle fingerprint bhi maangungi.")
+                  if (voiceLock) append("Aira", "Voice lock ON. Mic se sirf tumhari awaaz par kaam karungi (type karke bologe to chalega). Voice se app kholne se pehle fingerprint bhi maangungi.")
               }
 
               // ---------- Listening ----------
+              // Beep muting: speech recognizer ki start/stop beep dabane ke liye
+              private val audioMan by lazy { getSystemService(AudioManager::class.java) }
+              private val muted = mutableSetOf<Int>()
+              private val unmuteRunnable = Runnable { unmuteNow() }
+
+              private fun muteBeep(ms: Long) {
+                  for (st in intArrayOf(AudioManager.STREAM_MUSIC, AudioManager.STREAM_NOTIFICATION, AudioManager.STREAM_SYSTEM)) {
+                      try {
+                          if (!audioMan.isStreamMute(st) && muted.add(st)) audioMan.adjustStreamVolume(st, AudioManager.ADJUST_MUTE, 0)
+                      } catch (e: Exception) { muted.remove(st) }
+                  }
+                  handler.removeCallbacks(unmuteRunnable)
+                  handler.postDelayed(unmuteRunnable, ms)
+              }
+
+              private fun unmuteNow() {
+                  handler.removeCallbacks(unmuteRunnable)
+                  for (st in muted.toList()) {
+                      try { audioMan.adjustStreamVolume(st, AudioManager.ADJUST_UNMUTE, 0) } catch (e: Exception) {}
+                      muted.remove(st)
+                  }
+              }
+
               private val listener = object : RecognitionListener {
                   override fun onReadyForSpeech(p: Bundle?) { micBtn.text = "⏹" }
                   override fun onBeginningOfSpeech() { speechStartMs = System.currentTimeMillis() }
                   override fun onRmsChanged(rmsdB: Float) { if (rmsdB > 0f) { rmsSum += rmsdB; rmsCount++ } }
                   override fun onBufferReceived(buffer: ByteArray?) {}
-                  override fun onEndOfSpeech() {}
+                  override fun onEndOfSpeech() { muteBeep(800) }
                   override fun onPartialResults(p: Bundle?) {}
                   override fun onEvent(t: Int, p: Bundle?) {}
 
                   override fun onError(error: Int) {
+                      muteBeep(800)
+                      face.setListening(false)
                       listening = false; micBtn.text = "🎤"; capture.stop()
                       if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) { setHandsFree(false); return }
                       resumeIfHandsFree()
                   }
 
                   override fun onResults(r: Bundle?) {
+                      muteBeep(800)
+                      face.setListening(false)
                       listening = false; micBtn.text = "🎤"
                       val secs = ((System.currentTimeMillis() - speechStartMs) / 1000f + 0.5f).coerceIn(1f, 10f)
                       val pcm = capture.snapshot(secs)
@@ -789,7 +1281,7 @@ jobs:
                       val basicHint = voiceHint(t)
                       var text = t
                       if (handsFree) {
-                          val m = Regex("(?i)(hey |hi |ok )?(dost|दोस्त)[,!]? ?").find(text)
+                          val m = WAKE.find(text)
                           if (m == null) { resumeIfHandsFree(); return }
                           text = text.removeRange(m.range).trim()
                           if (text.isBlank()) { speak("Haan bolo!", "neutral"); return }
@@ -809,7 +1301,7 @@ jobs:
                       status("Mic share nahi hua (audio khali) - analysis off. " + modelStatus())
                       if (!warnedShared && (voiceLock || Analyzer.emoReady)) {
                           warnedShared = true
-                          append("Dost", "Note: is phone par speech recognition ke saath mic share nahi ho raha, to asli awaaz-analysis band hai. Purane andaze wale mode par chal rahi hoon.")
+                          append("Aira", "Note: is phone par speech recognition ke saath mic share nahi ho raha, to asli awaaz-analysis band hai. Purane andaze wale mode par chal rahi hoon.")
                       }
                   } else {
                       val emo = Analyzer.emotion(pcm)
@@ -826,7 +1318,7 @@ jobs:
 
                       if (voiceLock && score != null && score!! < SPEAKER_THRESHOLD) {
                           val msg = "Hmm, ye tumhari awaaz jaisi nahi lag rahi (match ${"%.2f".format(score)}). Tum ho to type karke bol do."
-                          append("Dost", msg)
+                          append("Aira", msg)
                           runOnUiThread { speak(msg, "neutral") }
                           return
                       }
@@ -846,7 +1338,7 @@ jobs:
               private fun startListening() {
                   if (listening || speaking || enrolling) return
                   if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-                      append("Dost", "Is phone mein speech recognition nahi mil raha. Likh ke bol do.")
+                      append("Aira", "Is phone mein speech recognition nahi mil raha. Likh ke bol do.")
                       setHandsFree(false); return
                   }
                   recognizer?.destroy()
@@ -858,12 +1350,14 @@ jobs:
                   rmsSum = 0f; rmsCount = 0; speechStartMs = System.currentTimeMillis()
                   if (Analyzer.spkReady || Analyzer.emoReady) capture.start()
                   listening = true
+                  face.setListening(true)
+                  muteBeep(1000)
                   recognizer?.startListening(i)
               }
 
               private fun toggleMic() {
                   if (listening) { recognizer?.stopListening(); return }
-                  tts?.stop(); speaking = false
+                  tts?.stop(); speaking = false; face.setTalking(false)
                   startListening()
               }
 
@@ -871,9 +1365,16 @@ jobs:
                   handsFree = on
                   handsBtn.text = if (on) "Hands-free: ON" else "Hands-free: OFF"
                   if (on) {
-                      append("Dost", "Hands-free ON. \"Dost, ...\" bolke bulao, main sun rahi hoon.")
+                      if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                          try { startForegroundService(Intent(this, ListenService::class.java)) } catch (e: Exception) {
+                              append("Aira", "Background service start nahi hui: ${e.message}")
+                          }
+                      }
+                      append("Aira", "Hands-free ON. \"Aira, ...\" bolke bulao, main sun rahi hoon.")
                       startListening()
                   } else {
+                      stopService(Intent(this, ListenService::class.java))
+                      face.setListening(false)
                       recognizer?.cancel(); listening = false; capture.stop(); micBtn.text = "🎤"
                   }
               }
@@ -890,19 +1391,19 @@ jobs:
               }
 
               private fun send(userText: String, hint: String, voiceMood: String?, fromVoice: Boolean) {
-                  if (apiKey().isBlank()) { runOnUiThread { askApiKey() }; return }
                   append("Tum", userText)
                   val content = if (hint.isNotEmpty()) "$userText\n[voice hint: $hint]" else userText
                   history.put(JSONObject().put("role", "user").put("content", content))
                   trimHistory()
+                  runOnUiThread { face.setThinking(true) }
                   try {
-                      val reply = ClaudeClient.chat(apiKey(), history)
+                      val reply = if (apiKey().isBlank()) LocalBrain.reply(userText) else GeminiClient.chat(apiKey(), history)
                       val needAuth = voiceLock && fromVoice && reply.toolCalls.any { it.first == "open_app" }
                       if (needAuth) {
-                          append("Dost", "Fingerprint se confirm karo, phir app kholungi.")
+                          append("Aira", "Fingerprint se confirm karo, phir app kholungi.")
                           askFingerprint { ok ->
                               if (ok) reply.toolCalls.forEach { (name, inp) -> Actions.run(this, name, inp) }
-                              else append("Dost", "Fingerprint match nahi hua, isliye app nahi khola.")
+                              else append("Aira", "Fingerprint match nahi hua, isliye app nahi khola.")
                           }
                       } else {
                           reply.toolCalls.forEach { (name, inp) -> Actions.run(this, name, inp) }
@@ -916,13 +1417,13 @@ jobs:
                       val finalMood = voiceMood ?: mood
 
                       history.put(JSONObject().put("role", "assistant").put("content", text))
-                      runOnUiThread { moodView.text = moodEmoji(finalMood) }
-                      append("Dost", text)
+                      runOnUiThread { face.setThinking(false); face.setEmotion(finalMood); idleSoon() }
+                      append("Aira", text)
                       runOnUiThread { speak(text, finalMood) }
                   } catch (e: Exception) {
                       history.remove(history.length() - 1)
-                      append("Dost", "Oops, error aa gaya: ${e.message}")
-                      runOnUiThread { resumeIfHandsFree() }
+                      append("Aira", "Oops, error aa gaya: ${e.message}")
+                      runOnUiThread { face.setThinking(false); face.setEmotion("sad"); idleSoon(); resumeIfHandsFree() }
                   }
               }
 
@@ -933,7 +1434,7 @@ jobs:
                   runOnUiThread {
                       try {
                           BiometricPrompt.Builder(this)
-                              .setTitle("Dost AI: confirm karo")
+                              .setTitle("Aira: confirm karo")
                               .setNegativeButton("Cancel", mainExecutor) { _, _ -> finish(false) }
                               .build()
                               .authenticate(CancellationSignal(), mainExecutor, object : BiometricPrompt.AuthenticationCallback() {
@@ -942,6 +1443,12 @@ jobs:
                               })
                       } catch (e: Exception) { finish(false) }
                   }
+              }
+
+              /** Kuch der baad chehra wapas khush (idle) ho jata hai. */
+              private fun idleSoon() {
+                  handler.removeCallbacks(idleRunnable)
+                  handler.postDelayed(idleRunnable, 7000)
               }
 
               private fun moodEmoji(m: String) = when (m) {
@@ -961,7 +1468,9 @@ jobs:
                       "happy", "excited" -> 1.2f to 1.1f
                       else -> 1.1f to 1.0f
                   }
+                  unmuteNow()
                   speaking = true
+                  face.setTalking(true)
                   tts?.setPitch(pitch)
                   tts?.setSpeechRate(rate)
                   tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, "dost")
@@ -969,6 +1478,8 @@ jobs:
 
               override fun onDestroy() {
                   handsFree = false
+                  unmuteNow()
+                  stopService(Intent(this, ListenService::class.java))
                   capture.stop(); recognizer?.destroy(); tts?.shutdown(); super.onDestroy()
               }
           }
